@@ -1,0 +1,383 @@
+"""
+Introduction & Background -
+The script defines two functions main and run_job and an exception that is triggered when an error occurs. 
+The main function is the entry point to the script, and it receives an HTTP request object as input. 
+It returns the output of the run_job function, which processes the request.
+The run_job function begins by logging that the function has processed an HTTP request. 
+The function establishes a connection to a Microsoft SQL Server Database and executes a query to select data. 
+It then extracts user data from a mapping table and appends it to the original data. 
+This function then proceeds to create JIRA tickets using the Atlassian library to handle the extracted data.
+The function returns an HTTP response object containing a JSON payload, which indicates whether the function was successful or not.
+
+Author - Soham Sarkar, Vivek Kulkarni, Ilango Mariappan
+Last Updated at 15th March 2023
+"""
+# Import Python packages
+import json
+import os
+import logging
+import pypyodbc as pyodbc
+
+# Import Azure Packages
+import azure.functions as func
+from dtautils.azure.auth import AzureService, ManagedAuth
+
+# Import Jira Packages
+from jira import JIRA
+
+# from atlassian import Jira
+
+# Listing kv secrets
+server_secret = "mssql-ingestion-server"
+db_secret = "mssql-ingestion-db"
+user_secret = "mssql-orchestration-admin-user"
+pwd_secret = "mssql-orchestration-admin-pwd"
+jira_host = "jira-host"
+jira_pat = "jira-access-token"
+
+
+class Dummy:
+    pass
+
+
+config = Dummy()
+
+# Initialize variables
+table_name = "[ReleaseManagement].[release_management_detail]"
+table_name_jira_user = "[ReleaseManagement].[release_management_user_jira_mapping]"
+driver = "{ODBC Driver 17 for SQL Server}"
+
+
+def get_kv_secrets(kv_url):
+    """
+    Returns:
+        Initialize secrets from kv into variables
+
+    Arguments:
+        kv_url {string} kv url inorder to fetch keys
+    """
+    try:
+        vault = ManagedAuth.get_vault_client(requestor=AzureService.FUNCTIONS)
+        config.server = vault.get_secret(kv_url, server_secret, "").value
+        config.database = vault.get_secret(kv_url, db_secret, "").value
+        config.username = vault.get_secret(kv_url, user_secret, "").value
+        config.password = vault.get_secret(kv_url, pwd_secret, "").value
+        config.jira_host_name = vault.get_secret(kv_url, jira_host, "").value
+        config.jira_pat_details = vault.get_secret(kv_url, jira_pat, "").value
+        logging.info("Fetched keys from key vault")
+
+    except Exception as e:
+        logging.error(str(e))
+        logging.error(e)
+        logging.error("An error occued while fetching KV secrets")
+        raise e
+
+
+######## Main Function - Entry Point for this program ########
+def main(req: func.HttpRequest) -> func.HttpResponse:
+    """Azure Function entry point"""
+    try:
+        return run_job(req)
+    except Exception as e:
+        # Return http response
+        logging.error(e)
+        return func.HttpResponse(
+            json.dumps({"status": "FAILED", "message": str(e)}),
+            status_code=400,
+            mimetype="application/json",
+        )
+
+
+######## Run Job - It establishes connnections, updataions, creation of JIRA issues, etc. ########
+def run_job(req: func.HttpRequest) -> func.HttpResponse:
+    """The actual function code that processes the request"""
+    try:
+        # Set up logging to monitor function execution
+        logging.info("Python HTTP trigger function processed a request.")
+
+        # initialize variables
+        kv_url = os.environ["GEN_KV_URL"]
+        get_kv_secrets(kv_url)
+        release_label = req.params.get("release_label")
+
+        # JIRA connection details
+        headers = JIRA.DEFAULT_OPTIONS["headers"].copy()
+        headers["Authorization"] = f"Bearer {config.jira_pat_details}"
+        jira = JIRA(server=config.jira_host_name, options={"headers": headers})
+
+        # Build the database connection string
+        conn_string = f"DRIVER={driver};SERVER={config.server};DATABASE={config.database};UID={config.username};PWD={config.password}"
+
+        # Establish connection to SQL Server DB
+        try:
+            conn = pyodbc.connect(conn_string)
+        except Exception as e:
+            logging.error("Error connecting to SQL Server:")
+            raise e
+
+        # Query the SQL Server DB for data that needs JIRA tickets created
+        result = []
+        try:
+            conn = pyodbc.connect(conn_string)
+            for row in conn.cursor().execute(
+                f"SELECT feature_name, crq_number, domain_name, release_label, architect, product_owner, expected_go_live_date, business_go_live_date, tech_lead, engineer FROM {table_name} WHERE jira_creation_status = 'yet to create' and release_label = '{release_label}'"
+            ):
+                result.append(
+                    {
+                        "feature_name": row[0],
+                        "crq_number": row[1],
+                        "domain_name": row[2],
+                        "release_label": row[3],
+                        "architect": row[4],
+                        "product_owner": row[5],
+                        "expected_go_live_date": row[6],
+                        "business_go_live_date": row[7],
+                        "tech_lead": row[8],
+                        "engineer": row[9],
+                    }
+                )
+            conn.close()
+            logging.info("The resultant list of dicts is..\n")
+            logging.info(result)
+
+            # Query the SQL Server DB for JIRA users that match each user in the result list
+            # result_user = []
+            jira_users = ["architect", "product_owner", "tech_lead", "engineer"]
+            for user in jira_users:
+                for index in result:
+                    res_len = index.__len__()
+                    for item in range(0, res_len - 1):
+                    #for col,val in index.items():
+                        #columnname = col
+                        columnname = list(index.keys())[item]
+                        if columnname == user:
+                            conn = pyodbc.connect(conn_string)
+                            for row2 in conn.cursor().execute(
+                                f"SELECT user_name, user_email_id from {table_name_jira_user} WHERE user_name ='%s'"
+                                % index[columnname]
+                            ):
+                                index[columnname + "_email_id"] = row2[1]
+                            conn.close()
+            logging.info(result)
+        except Exception as e:
+            logging.error("Error reading data from SQL Server:")
+            raise e
+
+        ########  JIRA CREATION STARTS HERE  ########
+        # Create JIRA tickets for each dictionary item in the list
+        for item in result:
+            logging.info("Before Try")
+            try:
+                logging.info("inside try")
+                # Create Story - QG1
+                QG1_Story_dict = {
+                    "project": {"key": "DTRM"},
+                    "summary": item["feature_name"] + " - QG-1",
+                    "issuetype": {"name": "Story"},
+                    "labels": [
+                        item["crq_number"],
+                        item["domain_name"],
+                        item["release_label"],
+                    ],
+                    "assignee": {"name": item["product_owner_email_id"]},
+                    "description": 'This Quality Gate needs to be completed by Data Tech Solution Designers/Domain Architects. There are 2 sub-tasks of this quality gate:\n\t\t\t1. General Solution Design and Architecture which needs to be completed by Domain Architects. They need to provide details/evidences for all the star * marked attributes. They need to provide their approval by writing "Approved" as a comment without adding anything else in that comment.\n\t\t\t2. Solution Design Deviation needs to completed by Domain Architects but approval for this needs to be availed from Lead Architects if there is any deviation from the solution. The first question needs to be answered with Y or N which will then decide whether Domain Architects need to log a technical debt somewhere in JIRA/Confluence mentioning the deviation details and reason for deviation. Lead Architect approval process remains same as point number 1.',
+                    'customfield_17200': item['expected_go_live_date'].isoformat(),
+                    'customfield_17201': item['business_go_live_date'].isoformat(),
+                }
+                logging.info(f"Dict for create_issueJIRA Creation QG1 is as follows {QG1_Story_dict}")
+                QG1_Story = jira.create_issue(fields=QG1_Story_dict)
+                logging.info(
+                    f"QG1_Story JIRA creation succesful, the key is {QG1_Story.key}"
+                )
+                QG1_Story_dict.clear()  # Clearing dictionary to avoid clutter
+
+                # Create Subtask 1 - QG1
+                QG1_Subtask1_dict = {
+                    "project": {"key": "DTRM"},
+                    "parent": {"key": QG1_Story.key},
+                    "summary": "Solution Design and Architecture",
+                    "issuetype": {"name": "Sub-task"},
+                    "assignee": {"name": item["architect_email_id"]},
+                    "description": "||Attribute||Value/Evidence||\n|State Dependencies|\t|\n|Dependencies Link|\t|\n"
+                    "|Third Party Systems (if applicable)|\t|\n|Security Approval required (Y/N/NR)?*|\t|\n"
+                    "|Security Approval evidence (Jira Ticket)|\t|\n|Regression Test Needed (Y/N)?*|\t|\n"
+                    "|Design Document Link*|\t|\n|SLAs/OLAs Evidence*|\t|\n"
+                    "|KPIs Evidence*|\t|\n|Domain Architect Approval in comments*|\t|",
+                }
+                logging.info(
+                    f"Dict for JIRA Creation QG1 Subtask1 is as follows {QG1_Subtask1_dict}"
+                )
+                QG1_Subtask1 = jira.create_issue(fields=QG1_Subtask1_dict)
+                logging.info(
+                    f"QG1_Subtask1 JIRA creation succesful, the key is {QG1_Subtask1.key}"
+                )
+                QG1_Subtask1_dict.clear()  # Clearing dictionary to avoid clutter
+
+                # Create Subtask 2 - QG1
+                QG1_Subtask2_dict = {
+                    "project": {"key": "DTRM"},
+                    "parent": {"key": QG1_Story.key},
+                    "summary": "Solution Design Deviation",
+                    "issuetype": {"name": "Sub-task"},
+                    "assignee": {"name": item["architect_email_id"]},
+                    "description": "||Attribute||Value/Evidence||\n|Any deviation from strategic solution(Y/N)*|\t|\n"
+                    "|Tech Debt Log link (if deviation in solution)|\t|\n"
+                    "|Tech Debt Approved (Lead Architects to provide in comments)|\t|",
+                }
+                logging.info(
+                    f"Dict for JIRA Creation QG1 Subtask2 is as follows {QG1_Subtask2_dict}"
+                )
+                QG1_Subtask2 = jira.create_issue(fields=QG1_Subtask2_dict)
+                logging.info(
+                    f"QG1_Subtask2 JIRA creation succesful, the key is {QG1_Subtask2.key}"
+                )
+                QG1_Subtask2_dict.clear()  # Clearing dictionary to avoid clutter
+
+                # Create Story - QG2
+                QG2_Story_dict = {
+                    "project": {"key": "DTRM"},
+                    "summary": item["feature_name"] + " - QG-2",
+                    "issuetype": {"name": "Story"},
+                    "labels": [
+                        item["crq_number"],
+                        item["domain_name"],
+                        item["release_label"],
+                    ],
+                    "assignee": {"name": item["tech_lead_email_id"]},
+                    "description": "This Quality Gate needs to be completed by Data Tech Technical Leads/ Domain Leads"
+                }
+                QG2_Story = jira.create_issue(fields=QG2_Story_dict)
+                logging.info(
+                    f"QG2_Story JIRA creation succesful, the key is {QG2_Story.key}"
+                )
+                QG2_Story_dict.clear()  # Clearing dictionary to avoid clutter
+
+                # Create Subtask 1 - QG2
+                QG2_Subtask1_dict = {
+                    "project": {"key": "DTRM"},
+                    "parent": {"key": QG2_Story.key},
+                    "summary": "Test Evidences",
+                    "issuetype": {"name": "Sub-task"},
+                    "assignee": {"name": item["engineer_email_id"]},
+                    "description": "||Attribute||Value/Evidence||\n|Functional testing evidence (ST / SIT / UAT)*|\t|\n"
+                    "|Non-Functional testing evidence (PT)|\t|\n"
+                    "|Regression Testing Evidence (mandatory if Solution Design has confirmed if regression required)|\t|\n"
+                    "|Data Quality/Integrity checks evidence*|\t|\n"
+                    "|Any open bugs evidence (provide Jira links in case of open bugs)|\t|",
+                }
+                QG2_Subtask1 = jira.create_issue(fields=QG2_Subtask1_dict)
+                logging.info(
+                    f"QG2_Subtask1 JIRA creation succesful, the key is {QG2_Subtask1.key}"
+                )
+                QG2_Subtask1_dict.clear()  # Clearing dictionary to avoid clutter
+
+                # Create Subtask 2 - QG2
+                QG2_Subtask2_dict = {
+                    "project": {"key": "DTRM"},
+                    "parent": {"key": QG2_Story.key},
+                    "summary": "Ops Details",
+                    "issuetype": {"name": "Sub-task"},
+                    "assignee": {"name": item["engineer_email_id"]},
+                    "description": "||Attribute||Value/Evidence||\n|Ops KT Completion Date* (DD-MM-YYYY)|\t|\n"
+                    "|Ops Guide Link*|\t|\n"
+                    "|Deployment Plan*|\t|\n"
+                    "|Rollback Plan*|\t|\n"
+                    "|Ops Approval in comments*|\t|",
+                }
+                QG2_Subtask2 = jira.create_issue(fields=QG2_Subtask2_dict)
+                logging.info(
+                    f"QG2_Subtask2 JIRA creation succesful, the key is {QG2_Subtask2.key}"
+                )
+                QG2_Subtask2_dict.clear()  # Clearing dictionary to avoid clutter
+
+                # Create Subtask 3 - QG2
+                QG2_Subtask3_dict = {
+                    "project": {"key": "DTRM"},
+                    "parent": {"key": QG2_Story.key},
+                    "summary": "Build and Test General Details",
+                    "issuetype": {"name": "Sub-task"},
+                    "assignee": {"name": item["engineer_email_id"]},
+                    "description": "||Attribute||Value/Evidence||\n|Regression configuration entry made? (Y/N)*|\t|\n"
+                    "|Pull Request Link*|\t|\n|Report User Count|\t|\n|Report Complexity|\t|\n|Report Run Type|\t|",
+                }
+                QG2_Subtask3 = jira.create_issue(fields=QG2_Subtask3_dict)
+                logging.info(
+                    f"QG2_Subtask3 JIRA creation succesful, the key is {QG2_Subtask3.key}"
+                )
+                QG2_Subtask3_dict.clear()  # Clearing dictionary to avoid clutter
+
+                # Create Subtask 4 - QG2
+                QG2_Subtask4_dict = {
+                    "project": {"key": "DTRM"},
+                    "parent": {"key": QG2_Story.key},
+                    "summary": "Build and Test Approvals",
+                    "issuetype": {"name": "Sub-task"},
+                    "assignee": {"name": item["engineer_email_id"]},
+                    "description": "||Attribute||Value/Evidence||\n|Infra approval (provide in the comment)|\t|\n"
+                    "|Technical Lead Approval* (provide in the comment)|\t|\n"
+                    "|Domain Lead Approval* (provide in the comment)|\t|\n"
+                    "|Business approval (only applicable in case of UAT, Y/N)?|\t|\n"
+                    "|Business approval evidence (only applicable in case of UAT)|\t|\n"
+                    "|Data Steward/Governance Approval* (provide in the comment)|\t|",
+                }
+                QG2_Subtask4 = jira.create_issue(fields=QG2_Subtask4_dict)
+                logging.info(
+                    f"QG2_Subtask4 JIRA creation succesful, the key is {QG2_Subtask4.key}"
+                )
+                QG2_Subtask4_dict.clear()  # Clearing dictionary to avoid clutter
+                # print('issue: Sample')
+
+            except:
+                logging.error(
+                    f'Story and Sub-tasks creation in-complete for : {item["release_label"]}'
+                )
+                raise e
+
+            #### Significance of update part - After JIRA Creation is done, we are going to update the 4 fields in db
+            #### jirar creation status, qg1 jira id, and qg2 jira id
+            #### This is for release management table
+
+            try:
+                if (
+                    "DTRM" in QG1_Story.key
+                    and "DTRM" in QG1_Subtask1.key
+                    and "DTRM" in QG1_Subtask2.key
+                    and "DTRM" in QG2_Story.key
+                    and "DTRM" in QG2_Subtask1.key
+                    and "DTRM" in QG2_Subtask2.key
+                    and "DTRM" in QG2_Subtask3.key
+                    and "DTRM" in QG2_Subtask4.key
+                ):
+                    logging.info(
+                        "Story and Sub-tasks creation successful. Now we will Update SQL DB for three things"
+                    )
+                    conn = pyodbc.connect(conn_string)
+                    logging.info(f'Updating for release label {item["release_label"]}')
+                    update_query_two = (
+                        f"UPDATE {table_name} SET jira_creation_status='created', qg1_jira_id='%s', qg2_jira_id='%s', master_sharepoint_sqldb=2 WHERE release_label='%s'"
+                        % (QG1_Story.key, QG2_Story.key, item["release_label"])
+                    )
+
+                    # Execute the insert query
+                    conn.cursor().execute(update_query_two)
+                    logging.info(
+                        f'Update for release label is successful {item["release_label"]}'
+                    )
+                    conn.commit()
+                    conn.close()
+            except:
+                logging.error("SQLdb update with jira id details got failed")
+                if conn is not None:
+                    conn.close()
+                raise e
+
+        # Return http response
+        return func.HttpResponse(
+            json.dumps(
+                {"status": "SUCCESS", "QG1_id": QG1_Story.key, "QG2_id": QG2_Story.key}
+            ),
+            status_code=200,
+            mimetype="application/json",
+        )
+    except Exception as e:
+        raise e
