@@ -10,7 +10,7 @@ This function then proceeds to create JIRA tickets using the Atlassian library t
 The function returns an HTTP response object containing a JSON payload, which indicates whether the function was successful or not.
 
 Author - Soham Sarkar, Vivek Kulkarni, Ilango Mariappan
-Last Updated at 15th March 2023
+Last Updated at 08th Sep 2023
 """
 # Import Python packages
 import json
