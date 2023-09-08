@@ -1,0 +1,587 @@
+######## Run Job - It establishes connnections, updations, reads data of JIRA issues, etc. ########
+def run_job_read_jira(req: func.HttpRequest) -> func.HttpResponse:
+    """The actual function code that processes the request"""
+    try:
+        # Set up logging to monitor function execution
+        logging.info("Python HTTP trigger function processed a request.")
+
+        # initialize variables
+        kv_url = os.environ["GEN_KV_URL"]
+        get_kv_secrets(kv_url)
+        release_label = req.params.get("release_label")
+
+        # JIRA connection details
+        headers = JIRA.DEFAULT_OPTIONS["headers"].copy()
+        headers["Authorization"] = f"Bearer {config.jira_pat_details}"
+        jira = JIRA(server=config.jira_host_name, options={"headers": headers})
+
+        # Build the database connection string
+        conn_string = f"DRIVER={driver};SERVER={config.server};DATABASE={config.database};UID={config.username};PWD={config.password}"
+
+        # Establish connection to SQL Server DB
+        try:
+            conn = pyodbc.connect(conn_string)
+        except Exception as e:
+            logging.error("Error connecting to SQL Server:")
+            raise e
+        # Query the SQL Server DB for data that needs JIRA tickets created
+        result = []
+        try:
+            conn = pyodbc.connect(conn_string)
+            for row in conn.cursor().execute(
+                f"SELECT feature_name, crq_number, domain_name, release_label, qg1_jira_id, qg2_jira_id FROM {table_name} WHERE release_status IN ('rejected','inprogress')"):
+                result.append(
+                    {
+                        "release_label":row[3],
+                        "qg1_jira_id": row[4],
+                        "qg2_jira_id": row[5]
+                    }
+                )
+            conn.close()
+            logging.info("The resultant list of dicts is..\n")
+            logging.info(result)
+        except Exception as e:
+            print("Error reading data from SQL Server:", e)
+            exit()
+        if not result:
+              print('Empty List')
+              exit()
+        else:
+            ########  JIRA DATA READING STARTS HERE  ########
+            # Read JIRA data for each dictionary item in the list
+            df_JIRA = pd.DataFrame(
+                columns=['release_label','product_owner', 'architect', 'dependencies',
+                         'dependency_link', 'third_party_system', 'security_approval',
+                         'security_approval_evidence_link', 'reg_test_needed', 'design_link', 'sla_evidence',
+                         'kpi_evidence', 'da_approved', 'da_approval_by', 'da_approval_date', 'strat_soln_deviation',
+                         'td_log_link', 'la_approved', 'la_approval_by', 'la_approval_date', 'tech_lead', 'engineer',
+                         'func_evidence_link', 'non_func_evidence_link', 'reg_evidence_link', 'dq_evidence',
+                         'open_bugs', 'open_bugs_link', 'ops_kt_compl_date', 'ops_guide_link', 'dep_plan_link',
+                         'rollback_plan_link', 'ops_approved', 'ops_approval_by', 'reg_config', 'pull_req_link',
+                         'infra_approved', 'infra_approval_by', 'tl_approved', 'tl_approval_by', 'dl_approved',
+                         'dl_approval_by', 'bus_approved', 'bus_approval_evidence', 'ds_approval', 'ds_approval_by'])
+            dataDict = {}
+            for index in result:
+                logging.info("Before Try")
+                try:
+                    logging.info("inside try")
+                    for key, ticket in index.items():
+                        # Reading key details from Stories
+                        if key != "qg1_jira_id" and key != "qg2_jira_id":
+                            dataDict.update({key: ticket})
+                        else:
+
+                            story = jira.issue(ticket)
+
+                            FeatureName = story.fields.summary
+                            FeatureStatus = story.fields.status
+                            Release_Label = story.fields.labels
+                            StoryAssignee = story.fields.assignee.displayName
+                            StoryReporter = story.fields.reporter.displayName
+                            Change_Description = story.fields.description
+                            ExpectedGoLive = story.fields.customfield_17200
+                            BusinessGoLive = story.fields.customfield_17201
+                            CRQNumber = ""
+                            DomainName = ""
+                            try:
+                                if (type(Release_Label) == list):
+                                    CRQNumber = Release_Label[0]
+                                    DomainName = Release_Label[1]
+                                    ReleaseName = Release_Label[2]
+
+                                else:
+                                    print("Inadequate Labels for - " + story.key)
+                            except:
+                                print("Labels not updated for - " + story.key)
+
+                            StoryAssigneeArr = StoryAssignee.split(',')
+                            FirstName = StoryAssigneeArr[1].strip()
+                            LastName = StoryAssigneeArr[0].split('-')[1].strip()
+                            AssigneeName = FirstName + ' ' + LastName
+                            #Assign QG1 and QG2 story data to a Data Dictionary
+                            if ' - QG1' in FeatureName:
+                                dataDict.update({"product_owner": AssigneeName})
+                                #dataDict.update({"expected_go_live_date": ExpectedGoLive, "business_go_live_date": BusinessGoLive})
+                            elif ' - QG2' in FeatureName:
+                                dataDict.update({"tech_lead": AssigneeName})
+
+                            subtasks = story.fields.subtasks
+                            SubtaskList = []
+                            # Reading the details from link Sub-Tasks
+                            for linkedtask in subtasks:
+                                ApproverFlag = ""
+                                subtaskKey = linkedtask.key
+                                subtask = jira.issue(subtaskKey)
+                                SubtaskList.append(subtask)
+                                TaskName = subtask.fields.summary
+                                TaskStatus = subtask.fields.status
+                                TaskAssignee = subtask.fields.assignee.displayName
+                                TaskAssigneeName = subtask.fields.assignee.name
+                                TaskAssigneeNameArr = TaskAssignee.split(',')
+                                TaskFirstName = TaskAssigneeNameArr[1].strip()
+                                TaskLastName = TaskAssigneeNameArr[0].split('-')[1].strip()
+                                SubTaskAssigneeName = TaskFirstName + ' ' + TaskLastName
+                                TaskReporter = subtask.fields.reporter.displayName
+
+                                # df_Attributes = pd.DataFrame([lineitem.split('|') for lineitem in Task_Description.split('\n')])
+                                # print(df_Attributes)
+                                Task_Description = subtask.fields.description
+                                paramlist = Task_Description.split('\n')
+                                paramcnt = paramlist.__len__()
+
+                                if 'SOLUTION DESIGN AND ARCHITECTURE' in TaskName.upper():
+                                    dataDict.update({"architect": SubTaskAssigneeName})
+                                    Due_Date = subtask.fields.customfield_15613
+                                    # dataDict.update({"due_date": Due_Date})
+                                    SolutionApproverFlag = ""
+                                    for paramind in range(0, paramcnt):
+                                        if paramind == 0:
+                                            strColumnName = paramlist[paramind]
+                                            print(strColumnName)
+                                        else:
+                                            print(paramlist[paramind])
+                                            AttributeArr = paramlist[paramind].split('|')
+                                            if 'State Dependencies' in AttributeArr[1]:
+                                                State_Dependencies = AttributeArr[2]
+                                                dataDict.update({"dependencies": State_Dependencies})
+                                            elif 'Dependencies Link' in AttributeArr[1]:
+                                                Dependencies_Link = AttributeArr[2]
+                                                dataDict.update({"dependency_link": Dependencies_Link})
+                                            elif 'Third Party Systems' in AttributeArr[1]:
+                                                Third_Party_Systems = AttributeArr[2]
+                                                dataDict.update({"third_party_system": Third_Party_Systems})
+                                            elif 'Security Approval required' in AttributeArr[1]:
+                                                Security_Approval = AttributeArr[2]
+                                                dataDict.update({"security_approval": Security_Approval})
+                                            elif 'Security Approval evidence' in AttributeArr[1]:
+                                                SecurityApproval_Evidence = AttributeArr[2]
+                                                dataDict.update({"security_approval_evidence_link": SecurityApproval_Evidence})
+                                            elif 'Regression Test Needed' in AttributeArr[1]:
+                                                Regression_Test = AttributeArr[2]
+                                                dataDict.update({"reg_test_needed": Regression_Test})
+                                            elif 'Design Document Link' in AttributeArr[1]:
+                                                Design_Document_Link = AttributeArr[2]
+                                                dataDict.update({"design_link": Design_Document_Link})
+                                            elif 'SLAs/OLAs Evidence' in AttributeArr[1]:
+                                                SLAs_OLAs_Evidence = AttributeArr[2]
+                                                dataDict.update({"sla_evidence": SLAs_OLAs_Evidence})
+                                            elif 'KPIs Evidence' in AttributeArr[1]:
+                                                KPIs_Evidence = AttributeArr[2]
+                                                dataDict.update({"kpi_evidence": KPIs_Evidence})
+                                            elif 'Domain Architect Approval in comments' in AttributeArr[1]:
+                                                Domain_Architect_Approval = AttributeArr[2]
+                                            # print(Functional_testing_evidence)
+                                    comments = subtask.fields.comment.comments
+                                    if comments.__len__() > 0:
+                                        for comment in comments:
+                                            Comment_Text = comment.body
+                                            Comment_Text = Comment_Text.strip()
+                                            if Comment_Text.upper() == 'APPROVED':
+                                                SolutionApprover = comment.author.displayName
+                                                if SolutionApprover == TaskAssignee:
+                                                    SolutionApproverFlag = "Y"
+                                                    Solution_Approved_date = comment.updated.split('T')[0]
+                                                    print(
+                                                        "Solution Design and Architecture Task - " + subtaskKey + " approved by - " + SolutionApprover)
+                                                else:
+                                                    SolutionApproverFlag = "N"
+                                                    print(
+                                                        "Incorrect Approver for Solution Design and Architecture task - " + subtaskKey + "|| Expected - " + TaskAssignee)
+                                        if SolutionApproverFlag == "":
+                                            SolutionApproverFlag = "N"
+                                            SolutionApprover = ''
+                                            print('Comments not updated for Solution Design and Architecture task - ' + subtaskKey)
+                                    else:
+                                        SolutionApproverFlag = "N"
+                                        SolutionApprover = ''
+                                        print('Comments not updated for Solution Design and Architecture task - ' + subtaskKey)
+                                    dataDict.update({"da_approved": SolutionApproverFlag, "da_approval_by": SolutionApprover,
+                                                     "da_approval_date": Solution_Approved_date})
+                                elif 'SOLUTION DESIGN DEVIATION' in TaskName.upper():
+                                    DeviationApproverFlag = ""
+                                    for paramind in range(0, paramcnt):
+                                        if paramind == 0:
+                                            strColumnName = paramlist[paramind]
+                                            print(strColumnName)
+                                        else:
+                                            print(paramlist[paramind])
+                                            AttributeArr = paramlist[paramind].split('|')
+                                            if 'Any deviation from strategic solution' in AttributeArr[1]:
+                                                DeviationFlag = AttributeArr[2]
+                                                dataDict.update({"strat_soln_deviation": DeviationFlag})
+                                            elif 'Tech Debt Log link' in AttributeArr[1]:
+                                                Tech_Debt_Log_link = AttributeArr[2]
+                                                dataDict.update({"td_log_link": Tech_Debt_Log_link})
+                                            elif 'Tech Debt Approved' in AttributeArr[1]:
+                                                if DeviationFlag == 'Y':
+                                                    TechDebt_Approver = AttributeArr[2][2:][:-2]
+                                            # print(Functional_testing_evidence)
+                                    comments = subtask.fields.comment.comments
+                                    if comments.__len__() > 0:
+                                        for comment in comments:
+                                            Comment_Text = comment.body
+                                            Comment_Text = Comment_Text.strip()
+                                            if Comment_Text.upper() == 'APPROVED':
+                                                DeviationApprover = comment.author.displayName
+                                                if DeviationFlag == 'Y':
+                                                    if DeviationApprover == TechDebt_Approver:
+                                                        DeviationApproverFlag = "Y"
+                                                        Deviation_Approved_date = comment.updated.split('T')[0]
+                                                        print(
+                                                            "Solution Design Deviation Task - " + subtaskKey + " approved by - " + TechDebt_Approver)
+                                                    else:
+                                                        DeviationApproverFlag = "N"
+                                                        Deviation_Approved_date = comment.updated.split('T')[0]
+                                                        print(
+                                                            "Incorrect Approver for Solution Design Deviation task - " + subtaskKey + "|| Expected - " + TechDebt_Approver)
+                                                elif DeviationFlag != 'Y':
+                                                    if DeviationApprover == TaskAssignee:
+                                                        DeviationApproverFlag = "Y"
+                                                        Deviation_Approved_date = comment.updated.split('T')[0]
+                                                        print(
+                                                            "Solution Design and Architecture Task - " + subtaskKey + " approved by - " + DeviationApprover)
+                                                    else:
+                                                        DeviationApproverFlag = "N"
+                                                        print(
+                                                            "Incorrect Approver for Solution Design and Architecture task - " + subtaskKey + "|| Expected - " + TaskAssignee)
+                                        if DeviationApproverFlag == "":
+                                            DeviationApproverFlag = "N"
+                                            DeviationApprover = ''
+                                            print('Comments not updated for Solution Design and Architecture task - ' + subtaskKey)
+                                    else:
+                                        DeviationApproverFlag = "F"
+                                        DeviationApprover = ''
+                                        print('Comments not updated for Solution Design and Architecture task - ' + subtaskKey)
+                                    dataDict.update({"la_approved": DeviationApproverFlag, "la_approval_by": DeviationApprover,
+                                                     "la_approval_date": Deviation_Approved_date})
+                                elif 'TEST EVIDENCES' in TaskName.upper():
+                                    dataDict.update({"engineer": SubTaskAssigneeName})
+                                    for paramind in range(0, paramcnt):
+                                        if paramind == 0:
+                                            strColumnName = paramlist[paramind]
+                                            print(strColumnName)
+                                        else:
+                                            print(paramlist[paramind])
+                                            AttributeArr = paramlist[paramind].split('|')
+                                            if 'Functional testing evidence (ST / SIT / UAT' in AttributeArr[1]:
+                                                Functional_testing = AttributeArr[2]
+                                                dataDict.update({"func_evidence_link": Functional_testing})
+                                            elif 'Non-Functional testing evidence (PT)' in AttributeArr[1]:
+                                                Non_Functional_testing = AttributeArr[2]
+                                                dataDict.update({"non_func_evidence_link": Non_Functional_testing})
+                                            elif 'Regression Testing Evidence' in AttributeArr[1]:
+                                                Regression_testing = AttributeArr[2]
+                                                dataDict.update({"reg_evidence_link": Regression_testing})
+                                            elif 'Data Quality/Integrity checks evidence*' in AttributeArr[1]:
+                                                DataQuality_Integrity = AttributeArr[2]
+                                                dataDict.update({"dq_evidence": DataQuality_Integrity})
+                                            elif 'Any open bugs evidence' in AttributeArr[1]:
+                                                Open_bugs_link = AttributeArr[2]
+                                                if Open_bugs_link == "":
+                                                    dataDict.update({"open_bugs": 'N'})
+                                                    dataDict.update({"open_bugs_link": ''})
+                                                else:
+                                                    dataDict.update({"open_bugs": 'Y'})
+                                                    dataDict.update({"open_bugs_link": Open_bugs_link})
+                                            # print(Functional_testing_evidence)
+                                elif 'OPS DETAILS' in TaskName.upper():
+                                    Ops_Approval = ""
+                                    for paramind in range(0, paramcnt):
+                                        if paramind == 0:
+                                            strColumnName = paramlist[paramind]
+                                            print(strColumnName)
+                                        else:
+                                            print(paramlist[paramind])
+                                            AttributeArr = paramlist[paramind].split('|')
+                                            if 'Ops KT Completion Date' in AttributeArr[1]:
+                                                OpsKT_CompletionDate = AttributeArr[2]
+                                                dataDict.update({"ops_kt_compl_date": OpsKT_CompletionDate})
+                                            elif 'Ops Guide Link' in AttributeArr[1]:
+                                                OpsGuideLink = AttributeArr[2]
+                                                dataDict.update({"ops_guide_link": OpsGuideLink})
+                                            elif 'Deployment Plan' in AttributeArr[1]:
+                                                DeploymentPlan = AttributeArr[2]
+                                                dataDict.update({"dep_plan_link": DeploymentPlan})
+                                            elif 'Rollback Plan' in AttributeArr[1]:
+                                                RollbackPlan = AttributeArr[2]
+                                                dataDict.update({"rollback_plan_link": RollbackPlan})
+                                            # elif 'Ops Approval in comments' in AttributeArr[1]:
+                                            # Ops_Approval = AttributeArr[2]
+                                    comments = subtask.fields.comment.comments
+                                    if comments.__len__() > 0:
+                                        for comment in comments:
+                                            Comment_Text = comment.body
+                                            Comment_Text = Comment_Text.strip()
+                                            if Comment_Text.upper() == 'APPROVED':
+                                                OpsApprover = comment.author.displayName
+                                                if OpsApprover == TaskAssignee:
+                                                    Ops_Approval = "Y"
+                                                    Ops_Approval_date = comment.updated.split('T')[0]
+                                                    print(
+                                                        "Solution Design and Architecture Task - " + subtaskKey + " approved by - " + OpsApprover)
+                                                else:
+                                                    Ops_Approval = "N"
+                                                    Ops_Approval_date = comment.updated.split('T')[0]
+                                                    print(
+                                                        "Incorrect Approver for task - " + subtaskKey + "|| Expected - " + TaskAssignee)
+                                        if Ops_Approval == "":
+                                            Ops_Approval = "N"
+                                            OpsApprover = ''
+                                            print('Comments not updated for task - ' + subtaskKey)
+                                    else:
+                                        Ops_Approval = "F"
+                                        OpsApprover = ''
+                                        print('Comments not updated for task - ' + subtaskKey)
+                                    dataDict.update({"ops_approved": Ops_Approval, "ops_approval_by": OpsApprover})
+                                elif 'BUILD AND TEST GENERAL DETAILS' in TaskName.upper():
+
+                                    for paramind in range(0, paramcnt):
+                                        if paramind == 0:
+                                            strColumnName = paramlist[paramind]
+                                            print(strColumnName)
+                                        else:
+                                            print(paramlist[paramind])
+                                            AttributeArr = paramlist[paramind].split('|')
+                                            if 'Regression configuration entry made' in AttributeArr[1]:
+                                                Regression_config = AttributeArr[2]
+                                                dataDict.update({"reg_config": Regression_config})
+                                            elif 'Pull Request Link' in AttributeArr[1]:
+                                                PullRequestLink = AttributeArr[2]
+                                                dataDict.update({"pull_req_link": PullRequestLink})
+                                elif 'BUILD AND TEST APPROVALS' in TaskName.upper():
+                                    Infra_Approval = ''
+                                    TechnicalLead_Approval = ''
+                                    DomainLead_Approval = ''
+                                    DataSteward_Approval = ''
+
+                                    for paramind in range(0, paramcnt):
+                                        if paramind == 0:
+                                            strColumnName = paramlist[paramind]
+                                            print(strColumnName)
+                                        else:
+                                            print(paramlist[paramind])
+                                            AttributeArr = paramlist[paramind].split('|')
+                                            Approvals = 'Infra approval|Technical Lead Approval|Domain Lead Approval|Data Steward/Governance Approval'
+
+                                            if 'Business approval' not in AttributeArr[1]:
+                                                ApprovalArr = Approvals.split('|')
+
+                                                for Approval in ApprovalArr:
+                                                    BuildTestFlag = ""
+                                                    if Approval in AttributeArr[1]:
+                                                        ApproverName = AttributeArr[2][2:][:-2]
+                                                        comments = subtask.fields.comment.comments
+                                                        if comments.__len__() > 0:
+                                                            for comment in comments:
+                                                                Comment_Text = comment.body
+                                                                Comment_Text = Comment_Text.strip()
+                                                                if Comment_Text.upper() == 'APPROVED':
+                                                                    BuildTestApprover = comment.author.name
+                                                                    if BuildTestApprover == ApproverName:
+                                                                        BuildTestFlag = "Y"
+                                                                        break
+                                                            if BuildTestFlag == "":
+                                                                BuildTestFlag = "N"
+                                                                print('Approval not given for  - ' + ApproverName)
+                                                        else:
+                                                            BuildTestFlag = "F"
+                                                            print('Comments not updated for task - ' + subtaskKey)
+
+                                                        if BuildTestFlag == 'Y' and Approval == 'Infra approval':
+                                                            Infra_Approval = 'Y'
+                                                            dataDict.update({"infra_approved": Infra_Approval})
+                                                            dataDict.update({"infra_approval_by": BuildTestApprover})
+                                                            break
+                                                        elif BuildTestFlag == 'Y' and Approval == 'Technical Lead Approval':
+                                                            TechnicalLead_Approval = 'Y'
+                                                            dataDict.update({"tl_approved": TechnicalLead_Approval})
+                                                            dataDict.update({"tl_approval_by": BuildTestApprover})
+                                                            break
+                                                        elif BuildTestFlag == 'Y' and Approval == 'Domain Lead Approval':
+                                                            DomainLead_Approval = 'Y'
+                                                            dataDict.update({"dl_approved": DomainLead_Approval})
+                                                            dataDict.update({"dl_approval_by": BuildTestApprover})
+                                                            break
+                                                        elif BuildTestFlag == 'Y' and Approval == 'Data Steward/Governance Approval':
+                                                            DataSteward_Approval = 'Y'
+                                                            dataDict.update({"ds_approval": DataSteward_Approval})
+                                                            dataDict.update({"ds_approval_by": BuildTestApprover})
+                                                            break
+                                                        else:
+                                                            if Infra_Approval == '':
+                                                                Infra_Approval = 'N'
+                                                                dataDict.update({"infra_approved": Infra_Approval})
+                                                                dataDict.update({"infra_approval_by": ''})
+                                                                break
+                                                            elif TechnicalLead_Approval == '':
+                                                                TechnicalLead_Approval = 'N'
+                                                                dataDict.update({"tl_approved": TechnicalLead_Approval})
+                                                                dataDict.update({"tl_approval_by": ''})
+                                                                break
+                                                            elif DomainLead_Approval == '':
+                                                                DomainLead_Approval = 'N'
+                                                                dataDict.update({"dl_approved": DomainLead_Approval})
+                                                                dataDict.update({"dl_approval_by": ''})
+                                                                break
+                                                            elif DataSteward_Approval == '':
+                                                                DataSteward_Approval = 'N'
+                                                                dataDict.update({"ds_approval": DataSteward_Approval})
+                                                                dataDict.update({"ds_approval_by": ''})
+                                                                break
+
+                                            elif 'Business approval (only applicable in case of UAT, Y/N)' in AttributeArr[1]:
+                                                BusinessApproval = AttributeArr[2]
+                                                if BusinessApproval == 'Y':
+                                                    try:
+                                                        FileName = subtask.fields.attachment.filename
+                                                        EmailAddr = subtask.fields.attachment.emailAddress
+                                                        BusinessApprovalEvidence = 'Y'
+                                                        print('Business approval evidence provided via file attached - ' + FileName)
+                                                        dataDict.update({'bus_approved': BusinessApprovalEvidence})
+                                                        dataDict.update({'bus_approval_evidence': FileName})
+                                                    except:
+                                                        print('Business approval evidence not provided')
+                                                        BusinessApprovalEvidence = 'N'
+                                                        dataDict.update({'bus_approved': BusinessApprovalEvidence})
+                                                        dataDict.update({'bus_approval_evidence': ''})
+
+                    #Assigning the Data Dictionary values to a Dataframe
+                    if bool(dataDict):
+                        df_JIRA.loc[len(df_JIRA.index)] = dataDict
+                        df_JIRA.reset_index(drop=True, inplace=True)
+                        print("JIRA Data for ticket : " + ticket + " is read successfully")
+                    else:
+                        print("JIRA Data for ticket : " + ticket + " is not read successfully")
+                except:
+                    logging.error(
+                        f'Story and Sub-tasks data reading in-complete for : {item["release_label"]}'
+                    )
+                    raise e
+
+            #### Significance of update part - After reading the data from JIRA Creation, we are going to update 48 fields in sqldb
+            #### This is for release management table
+            try:
+                if not df_JIRA.empty:
+                    conn = pyodbc.connect(conn_string)
+                    logging.info(f'Updating for release label {item["release_label"]}')
+                    for row in df_JIRA.iterrows():
+                        update_query = (
+                                f"UPDATE {table_name} SET product_owner='%s', "
+                                f"architect='%s', "
+                                f"dependencies='%s', "
+                                f"dependency_link='%s', "
+                                f"third_party_system='%s', "
+                                f"security_approval='%s', "
+                                f"security_approval_evidence_link='%s', "
+                                f"reg_test_needed='%s', "
+                                f"design_link='%s', "
+                                f"sla_evidence='%s', "
+                                f"kpi_evidence='%s', "
+                                f"da_approved='%s', "
+                                f"da_approval_by='%s', "
+                                f"da_approval_date='%s', "
+                                f"strat_soln_deviation='%s', "
+                                f"td_log_link='%s', "
+                                f"la_approved='%s', "
+                                f"la_approval_by='%s', "
+                                f"la_approval_date='%s', "
+                                f"tech_lead='%s', "
+                                f"engineer='%s', "
+                                f"func_evidence_link='%s', "
+                                f"non_func_evidence_link='%s', "
+                                f"reg_evidence_link='%s', "
+                                f"dq_evidence='%s', "
+                                f"open_bugs='%s', "
+                                f"open_bugs_link='%s', "
+                                f"ops_kt_compl_date='%s', "
+                                f"ops_guide_link='%s', "
+                                f"dep_plan_link='%s', "
+                                f"rollback_plan_link='%s', "
+                                f"ops_approved='%s', "
+                                f"ops_approval_by='%s', "
+                                f"reg_config='%s', "
+                                f"pull_req_link='%s', "
+                                f"infra_approved='%s', "
+                                f"infra_approval_by='%s', "
+                                f"tl_approved='%s', "
+                                f"tl_approval_by='%s', "
+                                f"dl_approved='%s', "
+                                f"dl_approval_by='%s', "
+                                f"bus_approved='%s', "
+                                f"bus_approval_evidence='%s', "
+                                f"ds_approval='%s', "
+                                f"ds_approval_by='%s', "
+                                f"master_sharepoint_sqldb=2 "
+                                f"WHERE release_label='%s'"
+                                % (row[1]['product_owner'],
+                                   row[1]['architect'],
+                                   row[1]["dependencies"],
+                                   row[1]["dependency_link"],
+                                   row[1]["third_party_system"],
+                                   row[1]["security_approval"],
+                                   row[1]["security_approval_evidence_link"],
+                                   row[1]["reg_test_needed"],
+                                   row[1]["design_link"],
+                                   row[1]["sla_evidence"],
+                                   row[1]["kpi_evidence"],
+                                   row[1]["da_approved"],
+                                   row[1]["da_approval_by"],
+                                   row[1]["da_approval_date"],
+                                   row[1]["strat_soln_deviation"],
+                                   row[1]["td_log_link"],
+                                   row[1]["la_approved"],
+                                   row[1]["la_approval_by"],
+                                   row[1]["la_approval_date"],
+                                   row[1]["tech_lead"],
+                                   row[1]["engineer"],
+                                   row[1]["func_evidence_link"],
+                                   row[1]["non_func_evidence_link"],
+                                   row[1]["reg_evidence_link"],
+                                   row[1]["dq_evidence"],
+                                   row[1]["open_bugs"],
+                                   row[1]["open_bugs_link"],
+                                   row[1]["ops_kt_compl_date"],
+                                   row[1]["ops_guide_link"],
+                                   row[1]["dep_plan_link"],
+                                   row[1]["rollback_plan_link"],
+                                   row[1]["ops_approved"],
+                                   row[1]["ops_approval_by"],
+                                   row[1]["reg_config"],
+                                   row[1]["pull_req_link"],
+                                   row[1]["infra_approved"],
+                                   row[1]["infra_approval_by"],
+                                   row[1]["tl_approved"],
+                                   row[1]["tl_approval_by"],
+                                   row[1]["dl_approved"],
+                                   row[1]["dl_approval_by"],
+                                   row[1]["bus_approved"],
+                                   row[1]["bus_approval_evidence"],
+                                   row[1]["ds_approval"],
+                                   row[1]["ds_approval_by"],
+                                   row[1]["release_label"]
+                                   )
+                        )
+                        # Execute the update query
+                        conn.cursor().execute(update_query)
+                        logging.info(
+                            f'Update for release label is successful {row[1]["release_label"]}'
+                        )
+                    conn.commit()
+                    conn.close()
+            except:
+                logging.error("SQLdb update with jira details got failed")
+                if conn is not None:
+                    conn.close()
+                raise e
+
+
+            # Return http response
+            return func.HttpResponse(
+                json.dumps(
+                    {"status": "SUCCESS", "QG1_id": index['qg1_jira_id'], "QG2_id": index['qg2_jira_id']}
+                ),
+                status_code=200,
+                mimetype="application/json",
+            )
+    except Exception as e:
+        raise e

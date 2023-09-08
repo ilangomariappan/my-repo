@@ -1,0 +1,129 @@
+######## Run Job - It establishes connnections, updations, updated JIRA issues on an update in SQLDB, etc. ########
+def run_job_read_jira(req: func.HttpRequest) -> func.HttpResponse:
+    """The actual function code that processes the request"""
+    try:
+        # Set up logging to monitor function execution
+        logging.info("Python HTTP trigger function processed a request.")
+
+        # initialize variables
+        kv_url = os.environ["GEN_KV_URL"]
+        get_kv_secrets(kv_url)
+        release_label = req.params.get("release_label")
+
+        # JIRA connection details
+        headers = JIRA.DEFAULT_OPTIONS["headers"].copy()
+        headers["Authorization"] = f"Bearer {config.jira_pat_details}"
+        jira = JIRA(server=config.jira_host_name, options={"headers": headers})
+
+        # Build the database connection string
+        conn_string = f"DRIVER={driver};SERVER={config.server};DATABASE={config.database};UID={config.username};PWD={config.password}"
+
+        # Establish connection to SQL Server DB
+        try:
+            conn = pyodbc.connect(conn_string)
+        except Exception as e:
+            logging.error("Error connecting to SQL Server:")
+            raise e
+        # Query the SQL Server DB for data that needs JIRA tickets created
+        result = []
+        try:
+            conn = pyodbc.connect(conn_string)
+            for row in conn.cursor().execute(
+                    f"SELECT feature_name, crq_number, domain_name, release_label, product_owner, architect, qg1_jira_id, tech_lead, engineer, g2_jira_id FROM {table_name} WHERE master_sharepoint_sqldb = 1"):
+                result.append(
+                    {
+                        "release_label": row[3],
+                        "product_owner": row[4],
+                        "architect": row[5],
+                        "qg1_jira_id": row[6],
+                        "expected_go_live_date": row[7],
+                        "business_go_live_date": row[8],
+                        "tech_lead": row[9],
+                        "engineer": row[10],
+                        "qg2_jira_id": row[11]
+                    }
+                )
+            conn.close()
+            logging.info("The resultant list of dicts is..\n")
+            logging.info(result)
+        except Exception as e:
+            print("Error reading data from SQL Server:", e)
+            exit()
+        if not result:
+            print('Empty List')
+            exit()
+        else:
+            # Query the SQL Server DB for JIRA users that match each user in the result list
+            # result_user = []
+            try:
+                jira_users = ["architect", "product_owner", "tech_lead", "engineer"]
+                for user in jira_users:
+                    for index in result:
+                        res_len = index.__len__()
+                        for item in range(0, res_len - 1):
+                            # for col,val in index.items():
+                            # columnname = col
+                            columnname = list(index.keys())[item]
+                            if columnname == user:
+                                conn = pyodbc.connect(conn_string)
+                                for row2 in conn.cursor().execute(
+                                        f"SELECT user_name, user_email_id from {table_name_jira_user} WHERE user_name ='%s'"
+                                        % index[columnname]
+                                ):
+                                    index[columnname + "_email_id"] = row2[1]
+                                conn.close()
+                logging.info(result)
+            except Exception as e:
+                print("Error reading data from SQL DB JIRA Users:", e)
+                exit()
+            ########  JIRA DATA UPDATE STARTS HERE  ########
+            # UPDATE JIRA data for each dictionary item in the list
+            dataDict ={}
+            for index in result:
+                logging.info("Before Try")
+                try:
+                    logging.info("inside try")
+                    for key, ticket in index.items():
+                        # Updating details to Stories
+                        if key != "qg1_jira_id" and key != "qg2_jira_id":
+                            dataDict.update({key: ticket})
+                        else:
+                            story = jira.issue(ticket)
+                            FeatureName = story.fields.summary
+                            if ' - QG1' in FeatureName:
+                                story.update(assignee={"name": index["product_owner_email_id"]})
+                                story.update(fields={'customfield_17200': index["expected_go_live_date"].isoformat()})
+                                story.update(fields={'customfield_17201':  index["business_go_live_date"].isoformat()})
+                            elif ' - QG2' in FeatureName:
+                                story.update(assignee={"name": index["tech_lead_email_id"]})
+                                story.update(fields={'customfield_17200': index["expected_go_live_date"].isoformat()})
+                                story.update(fields={'customfield_17201': index["business_go_live_date"].isoformat()})
+
+                            subtasks = story.fields.subtasks
+                            SubtaskList = []
+                            # Updating details to linked Sub-Tasks
+                            for linkedtask in subtasks:
+                                subtaskKey = linkedtask.key
+                                subtask = jira.issue(subtaskKey)
+                                SubtaskList.append(subtask)
+                                TaskName = subtask.fields.summary
+                                if 'SOLUTION DESIGN AND ARCHITECTURE' in TaskName.upper():
+                                    subtask.update(assignee={"name": index["architect_email_id"]})
+                                elif 'SOLUTION DESIGN DEVIATION' in TaskName.upper():
+                                    subtask.update(assignee={"name": index["architect_email_id"]})
+                                elif 'TEST EVIDENCES' in TaskName.upper():
+                                    subtask.update(assignee={"name": index["engineer_email_id"]})
+                                elif 'OPS DETAILS' in TaskName.upper():
+                                    subtask.update(assignee={"name": index["engineer_email_id"]})
+                                elif 'BUILD AND TEST GENERAL DETAILS' in TaskName.upper():
+                                    subtask.update(assignee={"name": index["engineer_email_id"]})
+                                elif 'BUILD AND TEST APPROVALS' in TaskName.upper():
+                                    subtask.update(assignee={"name": index["engineer_email_id"]})
+
+                except:
+                    logging.error(
+                        f'Story and Sub-tasks data update in JIRA in-complete for : {index["release_label"]}'
+                    )
+                    raise e
+    except Exception as e:
+        raise e
